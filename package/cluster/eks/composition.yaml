@@ -187,6 +187,87 @@ spec:
                 role: nodegroup
       name: containerRegistryRolePolicyAttachment
     - base:
+        apiVersion: kubernetes.crossplane.io/v1alpha1
+        kind: ProviderConfig
+        spec:
+          credentials:
+            source: InjectedIdentity
+      name: providerconfig-kubernetes-in-cluster
+      patches:
+        - fromFieldPath: spec.id
+          toFieldPath: metadata.name
+          transforms:
+            - type: string
+              string:
+                fmt: "%s-in-cluster"
+        # This ProviderConfig uses the XP cluster's authentication
+        # See https://github.com/crossplane-contrib/provider-kubernetes#developing-locally 
+      readinessChecks:
+        - type: None
+    - base:
+        apiVersion: kubernetes.crossplane.io/v1alpha1
+        kind: Object
+        spec:
+          forProvider:
+            manifest:
+              apiVersion: batch/v1
+              kind: Job
+              metadata:
+                namespace: upbound-system # we need access to the EKS secret before the composition is done
+              spec:
+                template:
+                  spec:
+                    restartPolicy: OnFailure
+                    containers:
+                    - name: kubectl-delete-aws-cni
+                      image: bitnami/kubectl:latest
+                      command: ["kubectl", "delete", "--namespace", "kube-system", "daemonset", "aws-node"]
+                      env:
+                      - name: KUBECONFIG
+                        value: "/.kube/kubeconfig"
+                      volumeMounts:
+                      - mountPath: "/.kube/"
+                        name: target-kubeconfig
+                        readOnly: true
+                    volumes:
+                    - name: target-kubeconfig
+                      secret:
+                        secretName: test-kubeconfig
+                        key: kubeconfig
+                backoffLimit: 4 
+      name: k8s-job-delete-cni-target-cluster
+      patches:
+        - fromFieldPath: spec.id
+          toFieldPath: metadata.name
+          transforms:
+            - type: string
+              string:
+                fmt: "%s-k8s-job-delete-eks-default-cni"
+        # - fromFieldPath: metadata.labels[crossplane.io/claim-namespace]
+        #   toFieldPath: spec.forProvider.manifest.metadata.namespace
+        - fromFieldPath: spec.id
+          toFieldPath: spec.providerConfigRef.name
+          transforms:
+            - type: string
+              string:
+                fmt: "%s-in-cluster"
+        # - fromFieldPath: spec.writeConnectionSecretToRef.namespace
+        #   toFieldPath: spec.forProvider.manifest.spec.template.spec.containers[0].volumes[0].secret.
+        # This ProviderConfig uses the above EKS cluster's connection secret as
+        # its credentials secret.
+        - fromFieldPath: metadata.uid
+          toFieldPath: spec.forProvider.manifest.spec.template.spec.volumes[0].secret.secretName
+          transforms:
+            - type: string
+              string:
+                fmt: "%s-ekscluster"
+        # Publish the job completion time to status
+        - type: ToCompositeFieldPath
+          fromFieldPath: status.atProvider.manifest.status.completionTime
+          toFieldPath: status.deleteDefaultCNI.completionTime
+      readinessChecks:
+        - type: None
+    - base:
         apiVersion: eks.aws.upbound.io/v1beta1
         kind: NodeGroup
         spec:
@@ -221,6 +302,12 @@ spec:
                 large: t3.large
         - fromFieldPath: spec.id
           toFieldPath: spec.forProvider.subnetIdSelector.matchLabels[networks.aws.platformref.upbound.io/network-id]
+        # Wait on provisioning the nodegroup until the Delete CNI job is done
+        #- fromFieldPath: status.deleteDefaultCNI.completionTime
+        - fromFieldPath: status.deleteDefaultCNI.completionTime
+          toFieldPath: metadata.annotations[eks.aws.platformref.upbound.io/delete-default-cni]
+          policy:
+            fromFieldPath: Required
     - base:
         apiVersion: eks.aws.upbound.io/v1beta1
         kind: Addon
@@ -257,7 +344,7 @@ spec:
             source: Secret
             secretRef:
               key: kubeconfig
-      name: providerConfig
+      name: providerConfig-helm
       patches:
         - fromFieldPath: spec.id
           toFieldPath: metadata.name
